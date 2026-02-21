@@ -341,15 +341,26 @@ class HybridGPT(nn.Module):
         return logits
 
     def _compute_loss(self, logits, targets, reduction='mean'):
-        """Compute loss, inserting -1 at scratchpad positions."""
+        """Compute loss, inserting -1 at scratchpad positions.
+
+        When reduction='none', returns loss tensor with same shape as targets (B, T),
+        extracting only token position losses (not scratchpad positions).
+        """
         cfg = self.config
         B, T_targets = targets.shape
 
         # Expand targets with -1 at scratchpad positions
         expanded = []
+        token_indices = []  # Track indices of token positions (non-scratchpad)
+        current_idx = 0
         for chunk_start in range(0, T_targets, cfg.chunk_size):
             chunk_end = min(chunk_start + cfg.chunk_size, T_targets)
+            chunk_len = chunk_end - chunk_start
             chunk_targets = targets[:, chunk_start:chunk_end]
+
+            # Track token indices
+            token_indices.extend(range(current_idx, current_idx + chunk_len))
+            current_idx += chunk_len
 
             # Scratchpad positions get -1 (ignore)
             scratch_ignore = torch.full(
@@ -357,6 +368,7 @@ class HybridGPT(nn.Module):
             )
             expanded.append(chunk_targets)
             expanded.append(scratch_ignore)
+            current_idx += cfg.n_scratchpad
 
         targets_expanded = torch.cat(expanded, dim=1)
 
@@ -364,13 +376,27 @@ class HybridGPT(nn.Module):
         assert logits.shape[1] == targets_expanded.shape[1], \
             f"Shape mismatch: logits {logits.shape[1]} vs targets {targets_expanded.shape[1]}"
 
-        # Flatten and compute loss
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets_expanded.view(-1),
-            ignore_index=-1,
-            reduction=reduction
-        )
+        # Compute loss
+        if reduction == 'none':
+            # Compute per-position loss
+            loss_expanded = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets_expanded.view(-1),
+                ignore_index=-1,
+                reduction='none'
+            )
+            # Reshape to (B, T_expanded)
+            loss_expanded = loss_expanded.view(B, -1)
+            # Extract only token positions (not scratchpad) to match targets shape
+            token_indices_t = torch.tensor(token_indices, device=logits.device)
+            loss = loss_expanded[:, token_indices_t]  # (B, T_targets)
+        else:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets_expanded.view(-1),
+                ignore_index=-1,
+                reduction=reduction
+            )
 
         return loss
 
