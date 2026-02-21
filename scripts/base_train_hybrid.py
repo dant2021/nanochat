@@ -30,6 +30,7 @@ from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, p
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
+from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 print_banner()
 
@@ -331,6 +332,24 @@ while True:
         })
         model.train()
 
+    # Sample from the model (only on master process)
+    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+        model.eval()
+        prompts = [
+            "The capital of France is",
+            "The chemical symbol of gold is",
+            "If yesterday was Friday, then tomorrow will be",
+            "The opposite of hot is",
+            "The planets of the solar system are:",
+        ]
+        engine = Engine(orig_model, tokenizer)
+        for prompt in prompts:
+            tokens = tokenizer(prompt, prepend="<|bos|>")
+            with autocast_ctx:
+                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+            print0(tokenizer.decode(sample[0]))
+        model.train()
+
     # Save checkpoint
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
@@ -370,6 +389,9 @@ while True:
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader)
 
+    # Save gradient norms before zeroing (for logging)
+    scratchpad_grad_norm = orig_model.scratchpad.grad.norm().item() if orig_model.scratchpad.grad is not None else 0.0
+
     # Optimizer step
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -407,9 +429,10 @@ while True:
         eta_str = ""
 
     epoch = dataloader_state_dict["epoch"]
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    scratchpad_param_norm = orig_model.scratchpad.norm().item()
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | scratch_g: {scratchpad_grad_norm:.4f} | scratch_p: {scratchpad_param_norm:.4f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
 
-    if step % 100 == 0:
+    if step % 10 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
@@ -420,11 +443,10 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            # Scratchpad metrics
+            "hybrid/scratchpad_grad_norm": scratchpad_grad_norm,
+            "hybrid/scratchpad_param_norm": scratchpad_param_norm,
         }
-        # Log scratchpad metrics
-        if orig_model.scratchpad.grad is not None:
-            log_data['gradients/scratchpad_norm'] = orig_model.scratchpad.grad.norm().item()
-        log_data['params/scratchpad_norm'] = orig_model.scratchpad.norm().item()
         wandb_run.log(log_data)
 
     # State update
