@@ -1,5 +1,5 @@
 """
-Train hybrid HRM-Nanochat model. From root directory of the project, run as:
+Train hybrid HRM-Nanochat model (V2 architecture). From root directory of the project, run as:
 
 python -m scripts.base_train_hybrid
 
@@ -8,7 +8,11 @@ or distributed as:
 torchrun --nproc_per_node=8 -m scripts.base_train_hybrid
 
 Example for a quick test:
-python -m scripts.base_train_hybrid --n-l-layers=4 --n-h-layers=2 --max-seq-len=512 --device-batch-size=4 --num-iterations=100
+python -m scripts.base_train_hybrid --n-l-encoder-layers=2 --n-l-decoder-layers=2 --n-h-layers=4 --max-seq-len=512 --device-batch-size=4 --num-iterations=100
+
+V2 Architecture: L-encoder → H-layers → L-decoder
+- H-layers only see L-encoder output (latent space), never token embeddings
+- L-decoder receives H-output + L-encoder residual
 """
 
 import os
@@ -24,7 +28,7 @@ from contextlib import nullcontext, contextmanager
 import wandb
 import torch
 
-from nanochat.gpt_hybrid import HybridGPT, HybridConfig
+from nanochat.gpt_hybrid import HybridGPTV2, HybridConfigV2
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -45,9 +49,10 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-# Model architecture - hybrid specific
-parser.add_argument("--n-l-layers", type=int, default=8, help="number of L-layers (local attention)")
-parser.add_argument("--n-h-layers", type=int, default=4, help="number of H-blocks (full attention on scratchpad)")
+# Model architecture - hybrid V2 specific
+parser.add_argument("--n-l-encoder-layers", type=int, default=2, help="number of L-encoder layers (token → latent)")
+parser.add_argument("--n-l-decoder-layers", type=int, default=2, help="number of L-decoder layers (latent → logits)")
+parser.add_argument("--n-h-layers", type=int, default=4, help="number of H-blocks (full attention in latent space)")
 parser.add_argument("--chunk-size", type=int, default=16, help="tokens per chunk for H-block processing")
 parser.add_argument("--n-scratchpad", type=int, default=2, help="number of scratchpad latents per chunk")
 parser.add_argument("--local-window-size", type=int, default=64, help="L-layer attention window size")
@@ -117,28 +122,30 @@ print0(f"Vocab size: {vocab_size:,}")
 # Initialize the Model
 
 def build_model_meta():
-    """Build a hybrid model on meta device (shapes/dtypes only, no data)."""
-    # Compute model_dim from n_l_layers (depth equivalent)
-    depth = args.n_l_layers
+    """Build a hybrid V2 model on meta device (shapes/dtypes only, no data)."""
+    # Compute model_dim from total L-layers (encoder + decoder)
+    total_l_layers = args.n_l_encoder_layers + args.n_l_decoder_layers
+    depth = total_l_layers
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
 
-    config = HybridConfig(
+    config = HybridConfigV2(
         sequence_len=args.max_seq_len,
         vocab_size=vocab_size,
         n_head=num_heads,
         n_kv_head=num_heads,
         n_embd=model_dim,
-        # Hybrid-specific
-        n_l_layers=args.n_l_layers,
+        # V2-specific: encoder/decoder split
+        n_l_encoder_layers=args.n_l_encoder_layers,
+        n_l_decoder_layers=args.n_l_decoder_layers,
         n_h_layers=args.n_h_layers,
         local_window_size=args.local_window_size,
         chunk_size=args.chunk_size,
         n_scratchpad=args.n_scratchpad,
     )
     with torch.device("meta"):
-        model_meta = HybridGPT(config)
+        model_meta = HybridGPTV2(config)
     return model_meta
 
 # Build the model
@@ -150,7 +157,9 @@ model_config_kwargs = {
     'n_head': model_config.n_head,
     'n_kv_head': model_config.n_kv_head,
     'n_embd': model_config.n_embd,
-    'n_l_layers': model_config.n_l_layers,
+    # V2 fields
+    'n_l_encoder_layers': model_config.n_l_encoder_layers,
+    'n_l_decoder_layers': model_config.n_l_decoder_layers,
     'n_h_layers': model_config.n_h_layers,
     'local_window_size': model_config.local_window_size,
     'chunk_size': model_config.chunk_size,
@@ -162,7 +171,7 @@ model.init_weights()
 
 # Checkpoint directory
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"hybrid_l{args.n_l_layers}_h{args.n_h_layers}"
+output_dirname = args.model_tag if args.model_tag else f"hybridv2_enc{args.n_l_encoder_layers}_dec{args.n_l_decoder_layers}_h{args.n_h_layers}"
 checkpoint_dir = os.path.join(base_dir, "hybrid_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
