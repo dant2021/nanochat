@@ -101,8 +101,9 @@ else:
     gpu_peak_flops = float('inf')
 
 # wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="hrm-nanochat", name=args.run, config=user_config)
+wandb_run_name = os.environ.get("WANDB_NAME", args.run)  # Allow env var override for torchrun compatibility
+use_dummy_wandb = wandb_run_name == "dummy" or not master_process
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="hrm-nanochat", name=wandb_run_name, config=user_config)
 
 # Flash Attention status
 if HAS_FA3:
