@@ -81,6 +81,7 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument("--no-compile", action="store_true", help="disable torch.compile for faster startup")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -184,7 +185,10 @@ if resuming:
 # Compile the model
 
 orig_model = model
-model = torch.compile(model, dynamic=False)
+if not args.no_compile:
+    model = torch.compile(model, dynamic=False)
+else:
+    print0("Skipping torch.compile (--no-compile flag set)")
 
 # -----------------------------------------------------------------------------
 # Scaling laws
